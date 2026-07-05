@@ -173,7 +173,7 @@ static void arm_virt_compat_default_set(MachineClass *mc)
  */
 static const MemMapEntry base_memmap[] = {
     /* Space up to 0x8000000 is reserved for a boot ROM */
-    [VIRT_FLASH] =              {          0, 0x08000000 },
+    [VIRT_FLASH] =              {          0, 0x00100000 },
     [VIRT_CPUPERIPHS] =         { 0x08000000, 0x00020000 },
     /* GIC distributor and CPU interfaces sit inside the CPU peripheral space */
     [VIRT_GIC_DIST] =           { 0x08000000, 0x00010000 },
@@ -184,7 +184,7 @@ static const MemMapEntry base_memmap[] = {
     /* The space in between here is reserved for GICv3 CPU/vCPU/HYP */
     [VIRT_GIC_ITS] =            { 0x08080000, 0x00020000 },
     /* This redistributor space allows up to 2*64kB*123 CPUs */
-    [VIRT_GIC_REDIST] =         { 0x080A0000, 0x00F60000 },
+    [VIRT_GIC_REDIST] =         { 0x080A0000, 0x00400000 },
     /* The GICv5 uses this address range differently from GICv2/v3/v4 */
     [VIRT_GICV5_IRS_S] =        { 0x08000000, 0x00010000 },
     [VIRT_GICV5_IRS_NS] =       { 0x08010000, 0x00010000 },
@@ -212,13 +212,13 @@ static const MemMapEntry base_memmap[] = {
     [VIRT_ACPI_PCIHP] =         { 0x090c0000, ACPI_PCIHP_SIZE },
     [VIRT_MMIO] =               { 0x0a000000, 0x00000200 },
     /* ...repeating for a total of NUM_VIRTIO_TRANSPORTS, each of that size */
-    [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x02000000 },
-    [VIRT_SECURE_MEM] =         { 0x0e000000, 0x01000000 },
-    [VIRT_PCIE_MMIO] =          { 0x10000000, 0x2eff0000 },
-    [VIRT_PCIE_PIO] =           { 0x3eff0000, 0x00010000 },
-    [VIRT_PCIE_ECAM] =          { 0x3f000000, 0x01000000 },
+    [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x00100000 },
+    [VIRT_SECURE_MEM] =         { 0x0e000000, 0x00100000 },
+    [VIRT_PCIE_MMIO] =          { 0x60000000, 0x1eff0000 },
+    [VIRT_PCIE_PIO] =           { 0x7eff0000, 0x00010000 },
+    [VIRT_PCIE_ECAM] =          { 0x7f000000, 0x01000000 },
     /* Actual RAM size depends on initial RAM and device memory settings */
-    [VIRT_MEM] =                { GiB, LEGACY_RAMLIMIT_BYTES },
+    [VIRT_MEM] =                { 2 * GiB, LEGACY_RAMLIMIT_BYTES },
 };
 
 /* Update the docs for highmem-mmio-size when changing this default */
@@ -586,8 +586,14 @@ static bool add_cpu_cache_hierarchy(void *fdt, CPUCoreCaches* cache,
                 continue;
             }
 
-            nodepath = g_strdup_printf("/cpus/cpu@%d/l%d-cache",
-                                       cpu_id, level);
+            MachineState *ms = MACHINE(qdev_get_machine());
+            if (ms->smp.cpus == 8) {
+                nodepath = g_strdup_printf("/cpus/cpu@%x/l%d-cache",
+                                           (unsigned int)(cpu_id << 8), level);
+            } else {
+                nodepath = g_strdup_printf("/cpus/cpu@%d/l%d-cache",
+                                           cpu_id, level);
+            }
             add_cache_node(fdt, nodepath, cache[i], next_level);
             found_cache = true;
             g_free(nodepath);
@@ -694,20 +700,54 @@ static void fdt_add_cpu_nodes(VirtMachineState *vms)
     vms->cpu_phandles = g_new0(uint32_t, smp_cpus);
 
     for (cpu = smp_cpus - 1; cpu >= 0; cpu--) {
-        socket_id = cpu / (ms->smp.clusters * ms->smp.cores * ms->smp.threads);
-        cluster_id = cpu / (ms->smp.cores * ms->smp.threads) % ms->smp.clusters;
-        core_id = cpu / ms->smp.threads % ms->smp.cores;
+        if (smp_cpus == 8) {
+            socket_id = 0;
+            if (cpu >= 0 && cpu <= 3) {
+                cluster_id = 0;
+                core_id = cpu;
+            } else if (cpu >= 4 && cpu <= 6) {
+                cluster_id = 1;
+                core_id = cpu - 4;
+            } else {
+                cluster_id = 2;
+                core_id = 0;
+            }
+        } else {
+            socket_id = cpu / (ms->smp.clusters * ms->smp.cores * ms->smp.threads);
+            cluster_id = cpu / (ms->smp.cores * ms->smp.threads) % ms->smp.clusters;
+            core_id = cpu / ms->smp.threads % ms->smp.cores;
+        }
 
-        char *nodename = g_strdup_printf("/cpus/cpu@%d", cpu);
         ARMCPU *armcpu = ARM_CPU(qemu_get_cpu(cpu));
         CPUState *cs = CPU(armcpu);
+        char *nodename;
+        if (smp_cpus == 8) {
+            nodename = g_strdup_printf("/cpus/cpu@%x", (unsigned int)arm_cpu_mp_affinity(armcpu));
+        } else {
+            nodename = g_strdup_printf("/cpus/cpu@%d", cpu);
+        }
         const char *prefix = NULL;
         uint32_t phandle;
 
         qemu_fdt_add_subnode(ms->fdt, nodename);
         qemu_fdt_setprop_string(ms->fdt, nodename, "device_type", "cpu");
-        qemu_fdt_setprop_string(ms->fdt, nodename, "compatible",
-                                    armcpu->dtb_compatible);
+        const char *cpu_compatible = armcpu->dtb_compatible;
+        if (smp_cpus == 8) {
+            cpu_compatible = "qcom,kryo";
+        }
+        qemu_fdt_setprop_string(ms->fdt, nodename, "compatible", cpu_compatible);
+
+        if (smp_cpus == 8) {
+            uint32_t freq = 0;
+            if (cpu >= 0 && cpu <= 3) {
+                freq = 1800000000U;
+            } else if (cpu >= 4 && cpu <= 6) {
+                freq = 2500000000U;
+            } else {
+                freq = 2995000000U;
+            }
+            qemu_fdt_setprop_cell(ms->fdt, nodename, "clock-frequency", freq);
+        }
 
         if (vms->psci_conduit != QEMU_PSCI_CONDUIT_DISABLED && smp_cpus > 1) {
             qemu_fdt_setprop_string(ms->fdt, nodename,
@@ -886,7 +926,24 @@ static void fdt_add_cpu_nodes(VirtMachineState *vms)
         for (cpu = smp_cpus - 1; cpu >= 0; cpu--) {
             char *map_path;
 
-            if (ms->smp.threads > 1) {
+            if (smp_cpus == 8) {
+                int soc_id = 0;
+                int clust_id = 0;
+                int cor_id = 0;
+                if (cpu >= 0 && cpu <= 3) {
+                    clust_id = 0;
+                    cor_id = cpu;
+                } else if (cpu >= 4 && cpu <= 6) {
+                    clust_id = 1;
+                    cor_id = cpu - 4;
+                } else {
+                    clust_id = 2;
+                    cor_id = 0;
+                }
+                map_path = g_strdup_printf(
+                    "/cpus/cpu-map/socket%d/cluster%d/core%d",
+                    soc_id, clust_id, cor_id);
+            } else if (ms->smp.threads > 1) {
                 map_path = g_strdup_printf(
                     "/cpus/cpu-map/socket%d/cluster%d/core%d/thread%d",
                     cpu / (ms->smp.clusters * ms->smp.cores * ms->smp.threads),
@@ -2332,6 +2389,37 @@ static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
     return ms->fdt;
 }
 
+static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
+{
+    /* Nop the single auto-generated memory node */
+    qemu_fdt_nop_node(fdt, "/memory@80000000");
+
+    static const struct {
+        uint64_t base;
+        uint64_t size;
+    } regions[] = {
+        { 0x808f4000ULL, 0xc000ULL },
+        { 0x80d00000ULL, 0x4a00000ULL },
+        { 0x8b91c000ULL, 0xe4000ULL },
+        { 0xa0400000ULL, 0x6a00000ULL },
+        { 0xa6e40000ULL, 0xc0000ULL },
+        { 0xa7000000ULL, 0x39600000ULL },
+        { 0xe5700000ULL, 0x3100000ULL },
+        { 0xf1400000ULL, 0xec00000ULL },
+        { 0x800000000ULL, 0x39900000ULL },
+        { 0x840000000ULL, 0x240000000ULL }
+    };
+
+    for (int i = 0; i < G_N_ELEMENTS(regions); i++) {
+        char *nodename = g_strdup_printf("/memory@%" PRIx64, regions[i].base);
+        qemu_fdt_add_subnode(fdt, nodename);
+        qemu_fdt_setprop_string(fdt, nodename, "device_type", "memory");
+        qemu_fdt_setprop_sized_cells(fdt, nodename, "reg", 2, regions[i].base, 2, regions[i].size);
+        g_free(nodename);
+    }
+
+}
+
 static void virt_build_smbios(VirtMachineState *vms)
 {
     MachineClass *mc = MACHINE_GET_CLASS(vms);
@@ -2429,6 +2517,11 @@ void virt_machine_done(Notifier *notifier, void *data)
 static uint64_t virt_cpu_mp_affinity(VirtMachineState *vms, int idx)
 {
     uint8_t clustersz;
+    MachineState *ms = MACHINE(vms);
+
+    if (ms->smp.cpus == 8) {
+        return idx << 8;
+    }
 
     /*
      * Adjust MPIDR to make TCG consistent (with 64-bit KVM hosts)
@@ -3123,8 +3216,22 @@ static void machvirt_init(MachineState *machine)
     fdt_add_timer_nodes(vms);
     fdt_add_cpu_nodes(vms);
 
-    memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base,
-                                machine->ram);
+    if (machine->ram_size > 2 * GiB) {
+        MemoryRegion *ram_low = g_new(MemoryRegion, 1);
+        MemoryRegion *ram_high = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(ram_low, NULL, "ram-low", machine->ram,
+                                 0, 2 * GiB);
+        memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base,
+                                    ram_low);
+
+        memory_region_init_alias(ram_high, NULL, "ram-high", machine->ram,
+                                 2 * GiB, machine->ram_size - 2 * GiB);
+        memory_region_add_subregion(sysmem, 0x800000000ULL, ram_high);
+    } else {
+        memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base,
+                                    machine->ram);
+    }
 
     cxl_fmws_update_mmio();
 
@@ -3175,8 +3282,15 @@ static void machvirt_init(MachineState *machine)
     }
 
     if (tag_sysmem) {
-        create_tag_ram(tag_sysmem, vms->memmap[VIRT_MEM].base,
-                       machine->ram_size, "mach-virt.tag");
+        if (machine->ram_size > 2 * GiB) {
+            create_tag_ram(tag_sysmem, vms->memmap[VIRT_MEM].base,
+                           2 * GiB, "mach-virt.tag-low");
+            create_tag_ram(tag_sysmem, 0x800000000ULL,
+                           machine->ram_size - 2 * GiB, "mach-virt.tag-high");
+        } else {
+            create_tag_ram(tag_sysmem, vms->memmap[VIRT_MEM].base,
+                           machine->ram_size, "mach-virt.tag");
+        }
     }
 
     vms->highmem_ecam &= (!firmware_loaded || aarch64);
@@ -3230,6 +3344,7 @@ static void machvirt_init(MachineState *machine)
     vms->bootinfo.board_id = -1;
     vms->bootinfo.loader_start = vms->memmap[VIRT_MEM].base;
     vms->bootinfo.get_dtb = machvirt_dtb;
+    vms->bootinfo.modify_dtb = virt_modify_dtb;
     vms->bootinfo.skip_dtb_autoload = true;
     vms->bootinfo.firmware_loaded = firmware_loaded;
     vms->bootinfo.psci_conduit = vms->psci_conduit;
@@ -3715,17 +3830,33 @@ static const CPUArchIdList *virt_possible_cpu_arch_ids(MachineState *ms)
 
         assert(!mc->smp_props.dies_supported);
         ms->possible_cpus->cpus[n].props.has_socket_id = true;
-        ms->possible_cpus->cpus[n].props.socket_id =
-            n / (ms->smp.clusters * ms->smp.cores * ms->smp.threads);
         ms->possible_cpus->cpus[n].props.has_cluster_id = true;
-        ms->possible_cpus->cpus[n].props.cluster_id =
-            (n / (ms->smp.cores * ms->smp.threads)) % ms->smp.clusters;
         ms->possible_cpus->cpus[n].props.has_core_id = true;
-        ms->possible_cpus->cpus[n].props.core_id =
-            (n / ms->smp.threads) % ms->smp.cores;
         ms->possible_cpus->cpus[n].props.has_thread_id = true;
-        ms->possible_cpus->cpus[n].props.thread_id =
-            n % ms->smp.threads;
+
+        if (max_cpus == 8) {
+            ms->possible_cpus->cpus[n].props.socket_id = 0;
+            if (n >= 0 && n <= 3) {
+                ms->possible_cpus->cpus[n].props.cluster_id = 0;
+                ms->possible_cpus->cpus[n].props.core_id = n;
+            } else if (n >= 4 && n <= 6) {
+                ms->possible_cpus->cpus[n].props.cluster_id = 1;
+                ms->possible_cpus->cpus[n].props.core_id = n - 4;
+            } else {
+                ms->possible_cpus->cpus[n].props.cluster_id = 2;
+                ms->possible_cpus->cpus[n].props.core_id = 0;
+            }
+            ms->possible_cpus->cpus[n].props.thread_id = 0;
+        } else {
+            ms->possible_cpus->cpus[n].props.socket_id =
+                n / (ms->smp.clusters * ms->smp.cores * ms->smp.threads);
+            ms->possible_cpus->cpus[n].props.cluster_id =
+                (n / (ms->smp.cores * ms->smp.threads)) % ms->smp.clusters;
+            ms->possible_cpus->cpus[n].props.core_id =
+                (n / ms->smp.threads) % ms->smp.cores;
+            ms->possible_cpus->cpus[n].props.thread_id =
+                n % ms->smp.threads;
+        }
     }
     return ms->possible_cpus;
 }

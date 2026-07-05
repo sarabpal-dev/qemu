@@ -819,6 +819,7 @@ static uint64_t load_aarch64_image(const char *filename, hwaddr mem_base,
     const size_t max_bytes = LOAD_IMAGE_MAX_DECOMPRESSED_BYTES;
     hwaddr kernel_load_offset = KERNEL64_LOAD_ADDR;
     uint64_t kernel_size = 0;
+    uint64_t text_offset = 0;
     uint8_t *buffer;
     ssize_t size;
 
@@ -855,7 +856,8 @@ static uint64_t load_aarch64_image(const char *filename, hwaddr mem_base,
         kernel_size = le64_to_cpu(hdrvals[1]);
 
         if (kernel_size != 0) {
-            kernel_load_offset = le64_to_cpu(hdrvals[0]);
+            text_offset = le64_to_cpu(hdrvals[0]);
+            kernel_load_offset = text_offset;
 
             /*
              * We write our startup "bootloader" at the very bottom of RAM,
@@ -879,6 +881,13 @@ static uint64_t load_aarch64_image(const char *filename, hwaddr mem_base,
      */
     if (kernel_size == 0) {
         kernel_size = size;
+    }
+
+    if (mem_base == 0x80000000ULL) {
+        kernel_load_offset += 0x28000000ULL;
+        if (kernel_size != 0 && text_offset < BOOTLOADER_MAX_SIZE) {
+            kernel_load_offset -= 2 * MiB;
+        }
     }
 
     *entry = mem_base + kernel_load_offset;
