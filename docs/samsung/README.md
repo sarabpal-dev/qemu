@@ -26,6 +26,29 @@ matches your exact kernel build.
 | `kallsyms2elf.py` | Converts `kallsyms.txt` output into a minimal symbol ELF for GDB |
 | `kallsyms.c` | Standalone C program to extract symbol tables offline from raw kernel binary |
 
+## Compiling for rootfs (`buildroot_tc`)
+
+The base `rootfs-defex.cpio.gz` environment is built using Buildroot. To compile custom binaries, tools, or tests compatible with this target, use the `buildroot_tc` toolchain.
+
+- **Toolchain Location**: `buildroot_tc` (`buildroot-tc.tar.xz`) is available under **GitHub Releases** specifically for the `samsung` branch.
+- **Cross-Compiling Example**:
+  ```bash
+  # Extract toolchain and add to PATH
+  tar -xf buildroot-tc.tar.xz
+  export PATH="$PWD/buildroot-tc/bin:$PATH"
+
+  # Compile for AArch64 target
+  aarch64-buildroot-linux-gnu-gcc -o test_app test_app.c
+  ```
+
+## Transferring Files to QEMU (SCP)
+
+Once QEMU is running (`./run.sh`), you can push files directly into the root directory (`/root/`) of the guest filesystem over SSH/SCP (port `13337`):
+
+```bash
+scp -P 13337 -o StrictHostKeyChecking=no path/to/file root@localhost:/root/
+```
+
 ## Kernel Symbol Extraction & Debugging
 
 ### Why Extract Symbols?
@@ -82,5 +105,8 @@ python3 kallsyms2elf.py kallsyms.txt vmlinux.kallsyms.elf
 
 # 6. Debug with GDB (in another terminal)
 ./debug.sh
+
+# 7. Transfer files to guest rootfs (in another terminal)
+scp -P 13337 -o StrictHostKeyChecking=no path/to/file root@localhost:/root/
 ```
 
