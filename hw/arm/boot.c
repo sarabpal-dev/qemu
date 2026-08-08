@@ -878,8 +878,12 @@ static uint64_t load_aarch64_image(const char *filename, hwaddr mem_base,
      * Kernels before v3.17 don't populate the image_size field, and
      * raw images have no header. For those our best guess at the size
      * is the size of the Image file itself.
+     * Also, when the file is larger than the header's image_size
+     * (e.g. EFI-stub wrapped kernels), use the actual file size so
+     * that the caller can correctly calculate image_high_addr and
+     * avoid placing DTB/initrd inside the kernel ROM region.
      */
-    if (kernel_size == 0) {
+    if (kernel_size == 0 || size > kernel_size) {
         kernel_size = size;
     }
 
@@ -990,6 +994,26 @@ static void arm_setup_direct_kernel_boot(ARMCPU *cpu,
     }
 
     info->entry = entry;
+
+    /*
+     * If we have a device tree blob but dtb_start wasn't already set
+     * (e.g. by the ELF path), place the DTB right after the kernel image
+     * with suitable alignment.  This is needed for raw aarch64 Images
+     * and uImages which skip the ELF dtb placement logic above.
+     */
+    if (have_dtb(info) && info->dtb_start == 0 && image_high_addr > 0) {
+        hwaddr align;
+        if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
+            /*
+             * AArch64 kernels map the fdt region with 2MB granularity
+             * during early boot, so prealign to 2MB to give us space.
+             */
+            align = 2 * MiB;
+        } else {
+            align = 4 * KiB;
+        }
+        info->dtb_start = QEMU_ALIGN_UP(image_high_addr, align);
+    }
 
     /*
      * We want to put the initrd far enough into RAM that when the

@@ -1364,9 +1364,10 @@ rt = not_found
 if host_os != 'windows'
   have_shm_open = cc.has_function('shm_open')
   if not have_shm_open
-    rt = cc.find_library('rt', required: true)
+    rt = cc.find_library('rt', required: false)
   endif
 endif
+
 
 libiscsi = not_found
 if not get_option('libiscsi').auto() or have_block

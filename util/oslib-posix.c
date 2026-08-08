@@ -44,6 +44,17 @@
 #include "qemu/thread-context.h"
 #include "qemu/main-loop.h"
 
+#ifdef __ANDROID__
+static inline int shm_open(const char *name, int oflag, mode_t mode) {
+    errno = ENOSYS;
+    return -1;
+}
+static inline int shm_unlink(const char *name) {
+    errno = ENOSYS;
+    return -1;
+}
+#endif
+
 #ifdef CONFIG_LINUX
 #include <sys/syscall.h>
 #endif

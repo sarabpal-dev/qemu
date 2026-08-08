@@ -2418,6 +2418,22 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
         g_free(nodename);
     }
 
+    /*
+     * RKP robuffer carveout: keep [0xa7000000, 0xa7f00000) out of the
+     * buddy allocator (the emulated hypervisor hands these pages out as
+     * pgtable/slab ro buffers) but leave them linear-mapped, like the
+     * real device's reserved carveout.  Without this the guest allocates
+     * the same pages twice (crash: wild pgtable entries into the
+     * carveout holes).
+     */
+    qemu_fdt_add_subnode(fdt, "/reserved-memory");
+    qemu_fdt_setprop_cell(fdt, "/reserved-memory", "#address-cells", 2);
+    qemu_fdt_setprop_cell(fdt, "/reserved-memory", "#size-cells", 2);
+    qemu_fdt_setprop(fdt, "/reserved-memory", "ranges", NULL, 0);
+    qemu_fdt_add_subnode(fdt, "/reserved-memory/rkp_pool@a7000000");
+    qemu_fdt_setprop_sized_cells(fdt, "/reserved-memory/rkp_pool@a7000000",
+                                 "reg", 2, 0xa7000000ULL, 2, 0x00f00000ULL);
+
 }
 
 static void virt_build_smbios(VirtMachineState *vms)

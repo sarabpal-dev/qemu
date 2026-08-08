@@ -1,5 +1,8 @@
 /GNUmakefile
 /build/
+/build-ndk-android/
+/build-static-android/
+/build-static-pc/
 /.cache/
 /.vscode/
 *.pyc

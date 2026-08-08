@@ -26,6 +26,8 @@
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/probe.h"
 #include "cpregs.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -1112,57 +1114,523 @@ void HELPER(pre_hvc)(CPUARMState *env)
     }
 }
 
+/*
+ * Samsung UH (RKP/KDP) hypervisor emulation.
+ *
+ * The Samsung kernel's uh_call() issues SMC #0 to talk to the Samsung
+ * hypervisor: RKP manages a read-only page pool, while KDP (Kernel Data
+ * Protection) keeps selected structures (creds, vfsmounts, slab
+ * free-pointers of protected caches) writable only by the hypervisor.
+ * There is no EL3 firmware in this setup, so the calls are emulated here.
+ *
+ * KDP makes the kernel delegate every write to protected structures to
+ * the hypervisor, and the kernel verifies the results (the panic checks
+ * in prepare_ro_creds() and security_integrity_current()), so the writes
+ * must be performed faithfully.  Structure layouts are not hardcoded:
+ * KDP_INIT and NS_INIT hand us every field offset we need.
+ *
+ * All guest memory accesses go through the guest's own page tables via
+ * cpu_memory_rw_debug(), which handles linear-map, kernel-image and
+ * vmalloc addresses with any physvirt/KASLR configuration.  The static
+ * offsets below are only a fallback for early-boot calls made before
+ * the linear map is fully set up:
+ *   kernel image: VA 0xffffffc008000000 -> PA 0xa8000000
+ *   linear map:   VA 0xffffff8000000000 -> PA 0x40000000 (QEMU virt DRAM)
+ */
+#define UH_APP_RKP              0xc300c001
+#define UH_APP_KDP              0xc300c002
+
+/* RKP commands */
+#define RKP_GET_RO_INFO         0x02
+#define RKP_ROBUFFER_ALLOC      0x07
+#define RKP_ROBUFFER_FREE       0x08
+
+/* KDP commands (include/linux/kdp.h) */
+#define KDP_INIT                0x00
+#define KDP_JARRO_TSEC_SIZE     0x02
+#define KDP_SET_SLAB_RO         0x03
+#define KDP_SET_FREEPTR         0x04
+#define KDP_PREPARE_RO_CRED     0x05
+#define KDP_SET_CRED_PGD        0x06
+#define KDP_SELINUX_CRED_FREE   0x07
+#define KDP_PGD_RWX             0x08
+#define KDP_MARK_PPT            0x09
+#define KDP_NS_INIT             0x10
+#define KDP_SET_NS_BP           0x11
+#define KDP_SET_NS_DATA         0x12
+#define KDP_SET_NS_ROOT_SB      0x13
+#define KDP_SET_NS_SB_VFSMOUNT  0x14
+#define KDP_SET_NS_FLAGS        0x15
+
+#define KDP_CMD_COPY_CREDS      0
+
+#define KIMAGE_VADDR            0xffffffc000000000ULL
+#define KIMAGE_VOFFSET          0xffffffbf60000000ULL
+#define LINEAR_MAP_VADDR        0xffffff8000000000ULL
+#define LINEAR_MAP_VOFFSET      0xffffff7f80000000ULL
+
+/*
+ * RKP robuffer pool.  On real hardware the hypervisor owns a reserved
+ * DDR carveout and recycles it; the kernel (pgd.c/pgd_alloc, mmu.c,
+ * slub.c) both allocates AND frees robuffer pages.  The previous model
+ * (a plain downward bump allocator with FREE stubbed out) had three
+ * fatal bugs: the range was never reserved from the guest's buddy
+ * allocator (double allocation), frees never recycled, and the pool
+ * walked off System RAM into the Qualcomm carveout holes — handing the
+ * kernel pgtable pages that are not in the linear map (crash at
+ * ffffff8026fffXXX, pool page 0xa6fff000 = allocation #3841).
+ *
+ * Now: a bounded bitmap allocator over [RKP_POOL_BASE, RKP_POOL_TOP).
+ * The matching reserved-memory DTB node (virt.c) keeps these pages out
+ * of the buddy allocator while staying linear-mapped, exactly like the
+ * device's real carveout.  Exhaustion returns 0 — the kernel treats
+ * rkp_ro_alloc() failure as ENOMEM instead of eating a wild page.
+ */
+#define RKP_POOL_BASE           0xa7000000ULL
+#define RKP_POOL_TOP            0xa7f00000ULL
+#define RKP_POOL_PAGES          ((RKP_POOL_TOP - RKP_POOL_BASE) >> 12)
+#define RKP_POOL_MAP_BYTES      ((RKP_POOL_PAGES + 7) / 8)
+
+static uint8_t rkp_pool_map[RKP_POOL_MAP_BYTES];
+static bool rkp_pool_inited;
+
+static void rkp_pool_init_once(void)
+{
+    if (!rkp_pool_inited) {
+        memset(rkp_pool_map, 0xff, sizeof(rkp_pool_map)); /* 1 = free */
+        rkp_pool_inited = true;
+    }
+}
+
+static int rkp_pool_bit_is_free(uint64_t idx)
+{
+    return (rkp_pool_map[idx >> 3] >> (idx & 7)) & 1;
+}
+
+static void rkp_pool_bit_set(uint64_t idx, bool free)
+{
+    if (free) {
+        rkp_pool_map[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+    } else {
+        rkp_pool_map[idx >> 3] &= (uint8_t)~(1u << (idx & 7));
+    }
+}
+
+/* Allocate nr contiguous pages; returns base PA or 0 on exhaustion. */
+static uint64_t rkp_pool_alloc(uint64_t nr)
+{
+    uint64_t run = 0, start = 0;
+    static const uint8_t zero_page[0x1000];
+
+    rkp_pool_init_once();
+    for (uint64_t i = 0; i < RKP_POOL_PAGES; i++) {
+        if (rkp_pool_bit_is_free(i)) {
+            if (run == 0) {
+                start = i;
+            }
+            if (++run == nr) {
+                for (uint64_t j = start; j < start + nr; j++) {
+                    rkp_pool_bit_set(j, false);
+                }
+                /*
+                 * The kernel trusts the hypervisor to hand ZEROED pages
+                 * (pgd_alloc()/rkp_ro_alloc() does no memset — b0q has no
+                 * pgd_ctor and bypasses __GFP_ZERO).  Fresh QEMU RAM is
+                 * zero, but recycled pool pages still hold stale pgtable
+                 * entries → wild walks (copy_page_range crash).  Zero on
+                 * every alloc, like the real ro-buffer allocator.
+                 */
+                for (uint64_t j = 0; j < nr; j++) {
+                    address_space_write(&address_space_memory,
+                                        RKP_POOL_BASE + (start + j) * 0x1000,
+                                        MEMTXATTRS_UNSPECIFIED,
+                                        zero_page, sizeof(zero_page));
+                }
+                return RKP_POOL_BASE + start * 0x1000;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    fprintf(stderr, "[uh] RKP pool EXHAUSTED (%llu pages requested)\n",
+            (unsigned long long)nr);
+    return 0;
+}
+
+static void rkp_pool_free_pa(uint64_t pa)
+{
+    if (pa < RKP_POOL_BASE || pa >= RKP_POOL_TOP || (pa & 0xfff)) {
+        return;
+    }
+    rkp_pool_bit_set((pa - RKP_POOL_BASE) >> 12, true);
+}
+
+/* Field offsets handed over by KDP_INIT (struct kdp_init) */
+static struct {
+    bool     valid;
+    uint64_t init_mm_pgd;    /* swapper_pg_dir */
+    uint32_t cred_size;      /* sizeof(struct cred_kdp) */
+    uint32_t pgd_mm;         /* offsetof(struct mm_struct, pgd) */
+    uint32_t bp_pgd_cred;    /* offsetof(struct cred_kdp, bp_pgd) */
+    uint32_t bp_task_cred;   /* offsetof(struct cred_kdp, bp_task) */
+    uint32_t security_cred;  /* offsetof(struct cred, security) */
+    uint32_t usage_cred;     /* offsetof(struct cred_kdp, use_cnt) */
+    uint32_t cred_task;      /* offsetof(struct task_struct, cred) */
+    uint32_t mm_task;        /* offsetof(struct task_struct, mm) */
+    uint32_t bp_cred_secptr; /* offsetof(struct task_security_struct, bp_cred) */
+} kdp_par;
+
+/* Field offsets handed over by NS_INIT (struct ns_param) */
+static struct {
+    bool     valid;
+    uint32_t bp_offset;      /* offsetof(struct kdp_vfsmount, bp_mount) */
+    uint32_t sb_offset;      /* offsetof(struct vfsmount, mnt_sb) */
+    uint32_t flag_offset;    /* offsetof(struct vfsmount, mnt_flags) */
+} ns_par = {
+    /* confirmed on this kernel even before NS_INIT arrives */
+    .bp_offset = 56, .sb_offset = 8, .flag_offset = 16,
+};
+
+static bool uh_guest_read(CPUState *cs, uint64_t va, void *buf, size_t len)
+{
+    return cpu_memory_rw_debug(cs, va, buf, len, false) == 0;
+}
+
+static bool uh_guest_write(CPUState *cs, uint64_t va, const void *buf, size_t len)
+{
+    uint64_t pa;
+
+    if (cpu_memory_rw_debug(cs, va, (void *)buf, len, true) == 0) {
+        return true;
+    }
+    /*
+     * Early-boot fallback for addresses not reachable through the guest
+     * page tables yet (host and guest are both little-endian).
+     */
+    if (va >= KIMAGE_VADDR) {
+        pa = va - KIMAGE_VOFFSET;
+    } else if (va >= LINEAR_MAP_VADDR) {
+        pa = va - LINEAR_MAP_VOFFSET;
+    } else {
+        fprintf(stderr, "[uh] write to unmapped guest VA 0x%016" PRIx64
+                " failed\n", va);
+        return false;
+    }
+    return address_space_write(&address_space_memory, pa,
+                               MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
+}
+
+static bool uh_write_u64(CPUState *cs, uint64_t va, uint64_t val)
+{
+    return uh_guest_write(cs, va, &val, sizeof(val));
+}
+
+static void kdp_handle_init(CPUState *cs, uint64_t par_va)
+{
+    /* struct kdp_init { u64 x3; u32 x20; u64; struct { u64 x2; }; } */
+    uint8_t buf[100];
+
+    if (!uh_guest_read(cs, par_va, buf, sizeof(buf))) {
+        fprintf(stderr, "[uh] KDP_INIT: cannot read params @0x%016" PRIx64
+                "\n", par_va);
+        return;
+    }
+    kdp_par.init_mm_pgd    = ldq_le_p(buf + 16);
+    kdp_par.cred_size      = ldl_le_p(buf + 24);
+    kdp_par.pgd_mm         = ldl_le_p(buf + 32);
+    kdp_par.bp_pgd_cred    = ldl_le_p(buf + 52);
+    kdp_par.bp_task_cred   = ldl_le_p(buf + 56);
+    kdp_par.security_cred  = ldl_le_p(buf + 64);
+    kdp_par.usage_cred     = ldl_le_p(buf + 68);
+    kdp_par.cred_task      = ldl_le_p(buf + 72);
+    kdp_par.mm_task        = ldl_le_p(buf + 76);
+    kdp_par.bp_cred_secptr = ldl_le_p(buf + 92);
+    kdp_par.valid = kdp_par.cred_size > 0 && kdp_par.cred_size <= 4096;
+    fprintf(stderr, "[uh] KDP_INIT: cred_size=%u pgd_mm=%u bp_pgd=%u "
+            "bp_task=%u security=%u use_cnt=%u cred_task=%u mm=%u bp_sec=%u\n",
+            kdp_par.cred_size, kdp_par.pgd_mm, kdp_par.bp_pgd_cred,
+            kdp_par.bp_task_cred, kdp_par.security_cred, kdp_par.usage_cred,
+            kdp_par.cred_task, kdp_par.mm_task, kdp_par.bp_cred_secptr);
+}
+
+static void kdp_handle_ns_init(CPUState *cs, uint64_t par_va)
+{
+    /* struct ns_param { u32 x6 }; data_offset is deprecated/unused */
+    uint8_t buf[24];
+
+    if (!uh_guest_read(cs, par_va, buf, sizeof(buf))) {
+        fprintf(stderr, "[uh] NS_INIT: cannot read params @0x%016" PRIx64
+                "\n", par_va);
+        return;
+    }
+    ns_par.bp_offset   = ldl_le_p(buf + 8);
+    ns_par.sb_offset   = ldl_le_p(buf + 12);
+    ns_par.flag_offset = ldl_le_p(buf + 16);
+    ns_par.valid = true;
+    fprintf(stderr, "[uh] KDP NS_INIT: bp=%u sb=%u flags=%u\n",
+            ns_par.bp_offset, ns_par.sb_offset, ns_par.flag_offset);
+}
+
+/*
+ * PREPARE_RO_CRED: the kernel allocated a cred_kdp from the (hypervisor
+ * protected) cred_jar_ro cache plus a use-count cell and a security blob,
+ * and hands us a stack image to install.  The kernel panics unless
+ * bp_task, cred.security and use_cnt are set exactly as it expects, and
+ * security_integrity_current() additionally requires bp_pgd to match the
+ * task's mm and tsec->bp_cred to point back at the cred.
+ */
+static void kdp_handle_prepare_ro_cred(CPUState *cs, CPUARMState *env)
+{
+    /* struct cred_param { u64 cred, cred_ro, use_cnt_ptr, sec_ptr, type,
+     *                     task_ptr/use_cnt }; */
+    uint8_t  buf[48];
+    uint64_t cred_va, cred_ro_va, use_cnt_va, sec_va, type, task_or_cnt;
+    uint64_t current, mm, pgd;
+    void    *img;
+
+    if (!kdp_par.valid) {
+        fprintf(stderr, "[uh] PREPARE_RO_CRED before valid KDP_INIT\n");
+        return;
+    }
+    if (!uh_guest_read(cs, env->xregs[2], buf, sizeof(buf))) {
+        fprintf(stderr, "[uh] PREPARE_RO_CRED: cannot read cred_param\n");
+        return;
+    }
+    cred_va     = ldq_le_p(buf + 0);
+    cred_ro_va  = ldq_le_p(buf + 8);
+    use_cnt_va  = ldq_le_p(buf + 16);
+    sec_va      = ldq_le_p(buf + 24);
+    type        = ldq_le_p(buf + 32);
+    task_or_cnt = ldq_le_p(buf + 40);
+
+    /* Install the prepared cred image into the protected object. */
+    img = g_malloc(kdp_par.cred_size);
+    if (uh_guest_read(cs, cred_va, img, kdp_par.cred_size)) {
+        uh_guest_write(cs, cred_ro_va, img, kdp_par.cred_size);
+    }
+    g_free(img);
+
+    uh_write_u64(cs, cred_ro_va + kdp_par.security_cred, sec_va);
+    uh_write_u64(cs, cred_ro_va + kdp_par.usage_cred, use_cnt_va);
+
+    current = env->xregs[3];
+    if (type == KDP_CMD_COPY_CREDS) {
+        uh_write_u64(cs, cred_ro_va + kdp_par.bp_task_cred, task_or_cnt);
+    } else {
+        uh_write_u64(cs, cred_ro_va + kdp_par.bp_task_cred, current);
+        pgd = kdp_par.init_mm_pgd;
+        if (uh_guest_read(cs, current + kdp_par.mm_task, &mm, sizeof(mm))
+            && mm) {
+            uh_guest_read(cs, mm + kdp_par.pgd_mm, &pgd, sizeof(pgd));
+        }
+        uh_write_u64(cs, cred_ro_va + kdp_par.bp_pgd_cred, pgd);
+    }
+
+    /* tsec->bp_cred = cred_ro, checked by is_kdp_invalid_cred_sp() */
+    uh_write_u64(cs, sec_va + kdp_par.bp_cred_secptr, cred_ro_va);
+}
+
+/* Handle Samsung KDP (Kernel Data Protection) uh_calls */
+static bool handle_kdp_smc(CPUARMState *env, CPUState *cs)
+{
+    uint64_t command = env->xregs[1];
+
+    switch (command) {
+    case KDP_INIT:
+        kdp_handle_init(cs, env->xregs[2]);
+        break;
+
+    case KDP_NS_INIT:
+        kdp_handle_ns_init(cs, env->xregs[2]);
+        break;
+
+    case KDP_SET_NS_BP:
+        /* x2=kdp_vfsmount VA, x3=mount VA: vfsmount->bp_mount = mount */
+        uh_write_u64(cs, env->xregs[2] + ns_par.bp_offset, env->xregs[3]);
+        break;
+
+    case KDP_SET_NS_ROOT_SB:
+        /* x2=vfsmount VA, x3=dentry VA, x4=superblock VA; mnt_root is @0 */
+        uh_write_u64(cs, env->xregs[2], env->xregs[3]);
+        uh_write_u64(cs, env->xregs[2] + ns_par.sb_offset, env->xregs[4]);
+        break;
+
+    case KDP_SET_NS_FLAGS: {
+        /* x2=vfsmount VA, x3=flags; mnt_flags is an int */
+        uint32_t flags = (uint32_t)env->xregs[3];
+
+        uh_guest_write(cs, env->xregs[2] + ns_par.flag_offset,
+                       &flags, sizeof(flags));
+        break;
+    }
+
+    case KDP_SET_FREEPTR:
+        /* slub freepointer of protected caches: x2=object, x3=s->offset,
+         * x5=value to store at object+offset */
+        uh_write_u64(cs, env->xregs[2] + env->xregs[3], env->xregs[5]);
+        break;
+
+    case KDP_SELINUX_CRED_FREE:
+        /* x2=&cred->security: NULL it in the protected cred */
+        uh_write_u64(cs, env->xregs[2], 0);
+        break;
+
+    case KDP_SET_CRED_PGD: {
+        /* x2=cred_kdp VA, x3=pgd VA: cred_kdp->bp_pgd = pgd */
+        uint64_t cur, cur_cred, real_cred, bp_task;
+
+        if (!kdp_par.valid) {
+            break;
+        }
+        uh_write_u64(cs, env->xregs[2] + kdp_par.bp_pgd_cred,
+                     env->xregs[3]);
+        /*
+         * exec's SET_CRED_PGD passes only current->cred (subjective).
+         * If an override cred is installed, real_cred would keep a stale
+         * bp_pgd and cmp_sec_integrity() would flag it once revert_creds()
+         * restores it.  Mirror the write into real_cred, but only when it
+         * verifiably belongs to this same task.  current is in sp_el0.
+         */
+        cur = env->sp_el[0];
+        if (!uh_guest_read(cs, cur + kdp_par.cred_task,
+                           &cur_cred, sizeof(cur_cred)) ||
+            cur_cred != env->xregs[2]) {
+            break;      /* call is for another task's cred (fork path) */
+        }
+        if (!uh_guest_read(cs, cur + kdp_par.cred_task - 8,
+                           &real_cred, sizeof(real_cred)) ||
+            real_cred == env->xregs[2] || real_cred < LINEAR_MAP_VADDR) {
+            break;      /* no distinct real_cred, or implausible pointer */
+        }
+        if (!uh_guest_read(cs, real_cred + kdp_par.bp_task_cred,
+                           &bp_task, sizeof(bp_task)) || bp_task != cur) {
+            break;      /* not a KDP cred of this task */
+        }
+        uh_write_u64(cs, real_cred + kdp_par.bp_pgd_cred, env->xregs[3]);
+        break;
+    }
+
+    case KDP_PREPARE_RO_CRED:
+        kdp_handle_prepare_ro_cred(cs, env);
+        break;
+
+    case KDP_JARRO_TSEC_SIZE:    /* informational only */
+    case KDP_SET_SLAB_RO:        /* pages stay writable in our model */
+    case KDP_PGD_RWX:            /* pages are already RWX */
+    case KDP_MARK_PPT:           /* exec bookkeeping */
+    case KDP_SET_NS_DATA:        /* mnt.data deprecated */
+    case KDP_SET_NS_SB_VFSMOUNT: /* hypervisor-internal bookkeeping */
+        break;
+
+    default:
+        fprintf(stderr, "[uh] unhandled KDP command 0x%" PRIx64 "\n",
+                command);
+        break;
+    }
+
+    env->xregs[0] = 0;
+    env->pc += 4;
+    cpu_loop_exit(cs);
+    return true;
+}
+
+/* Handle Samsung RKP (Real-time Kernel Protection) uh_calls */
+static bool handle_rkp_smc(CPUARMState *env, CPUState *cs)
+{
+    uint64_t app_id  = env->xregs[0];
+    uint64_t command = env->xregs[1];
+    uint64_t out_ptr_va;
+    uint64_t nr_pages;
+    uint64_t alloc_pa;
+
+    if (app_id != UH_APP_RKP) {
+        return false;
+    }
+
+    switch (command) {
+    case RKP_ROBUFFER_ALLOC: {
+        uint64_t base;
+
+        out_ptr_va = env->xregs[2];
+        nr_pages   = env->xregs[3];
+        if (nr_pages == 0) {
+            nr_pages = 1;
+        }
+
+        base = rkp_pool_alloc(nr_pages);
+        for (uint64_t i = 0; i < nr_pages; i++) {
+            alloc_pa = base ? base + i * 0x1000 : 0;
+            uh_write_u64(cs, out_ptr_va + i * 8, alloc_pa);
+        }
+
+        env->xregs[0] = 0;
+        env->pc += 4;
+        cpu_loop_exit(cs);
+        return true;
+    }
+
+    case RKP_ROBUFFER_FREE: {
+        /* x2 = page VA as returned to the kernel (__phys_to_virt(pa)) */
+        uint64_t va = env->xregs[2];
+
+        if (va >= LINEAR_MAP_VADDR) {
+            rkp_pool_free_pa(va - LINEAR_MAP_VOFFSET);
+        } else {
+            rkp_pool_free_pa(va);   /* tolerate a raw PA */
+        }
+
+        env->xregs[0] = 0;
+        env->pc += 4;
+        cpu_loop_exit(cs);
+        return true;
+    }
+
+    case RKP_GET_RO_INFO:
+        /* x2 = &robuffer_base (PA), x3 = &robuffer_size — kernel uses
+         * phys_to_virt(base) for range checks (drivers/uh/rkp.c). */
+        uh_write_u64(cs, env->xregs[2], RKP_POOL_BASE);
+        uh_write_u64(cs, env->xregs[3], RKP_POOL_TOP - RKP_POOL_BASE);
+        env->xregs[0] = 0;
+        env->pc += 4;
+        cpu_loop_exit(cs);
+        return true;
+
+    default:
+        env->xregs[0] = 0;
+        env->pc += 4;
+        cpu_loop_exit(cs);
+        return true;
+    }
+}
+
+/* Unified handler for Samsung UH SMC calls */
+static bool handle_uh_smc(CPUARMState *env, CPUState *cs)
+{
+    uint64_t app_id = env->xregs[0];
+
+    switch (app_id) {
+    case UH_APP_RKP:
+        return handle_rkp_smc(env, cs);
+    case UH_APP_KDP:
+        return handle_kdp_smc(env, cs);
+    default:
+        /* Generic stub for other UH apps: return success */
+        env->xregs[0] = 0;
+        env->pc += 4;
+        cpu_loop_exit(cs);
+        return true;
+    }
+}
+
 void HELPER(pre_smc)(CPUARMState *env, uint32_t syndrome)
 {
     ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = CPU(cpu);
     int cur_el = arm_current_el(env);
     bool secure = arm_is_secure(env);
     bool smd_flag = env->cp15.scr_el3 & SCR_SMD;
 
-    /*
-     * SMC behaviour is summarized in the following table.
-     * This helper handles the "Trap to EL2" and "Undef insn" cases.
-     * The "Trap to EL3" and "PSCI call" cases are handled in the exception
-     * helper.
-     *
-     *  -> ARM_FEATURE_EL3 and !SMD
-     *                           HCR_TSC && NS EL1   !HCR_TSC || !NS EL1
-     *
-     *  Conduit SMC, valid call  Trap to EL2         PSCI Call
-     *  Conduit SMC, inval call  Trap to EL2         Trap to EL3
-     *  Conduit not SMC          Trap to EL2         Trap to EL3
-     *
-     *
-     *  -> ARM_FEATURE_EL3 and SMD
-     *                           HCR_TSC && NS EL1   !HCR_TSC || !NS EL1
-     *
-     *  Conduit SMC, valid call  Trap to EL2         PSCI Call
-     *  Conduit SMC, inval call  Trap to EL2         Undef insn
-     *  Conduit not SMC          Trap to EL2         Undef insn
-     *
-     *
-     *  -> !ARM_FEATURE_EL3
-     *                           HCR_TSC && NS EL1   !HCR_TSC || !NS EL1
-     *
-     *  Conduit SMC, valid call  Trap to EL2         PSCI Call
-     *  Conduit SMC, inval call  Trap to EL2         Undef insn
-     *  Conduit not SMC          Undef or trap[1]    Undef insn
-     *
-     * [1] In this case:
-     *  - if HCR_EL2.NV == 1 we must trap to EL2
-     *  - if HCR_EL2.NV == 0 then newer architecture revisions permit
-     *    AArch64 (but not AArch32) to trap to EL2 as an IMPDEF choice
-     *  - otherwise we must UNDEF
-     * We take the IMPDEF choice to always UNDEF if HCR_EL2.NV == 0.
-     */
-
-    /* On ARMv8 with EL3 AArch64, SMD applies to both S and NS state.
-     * On ARMv8 with EL3 AArch32, or ARMv7 with the Virtualization
-     *  extensions, SMD only applies to NS state.
-     * On ARMv7 without the Virtualization extensions, the SMD bit
-     * doesn't exist, but we forbid the guest to set it to 1 in scr_write(),
-     * so we need not special case this here.
-     */
+    /* On ARMv8 with EL3 AArch64, SMD applies to both S and NS state. */
     bool smd = arm_feature(env, ARM_FEATURE_AARCH64) ? smd_flag
                                                      : smd_flag && !secure;
 
@@ -1170,36 +1638,45 @@ void HELPER(pre_smc)(CPUARMState *env, uint32_t syndrome)
         !(arm_hcr_el2_eff(env) & HCR_NV) &&
         cpu->psci_conduit != QEMU_PSCI_CONDUIT_SMC) {
         /*
-         * If we have no EL3 then traditionally SMC always UNDEFs and can't be
-         * trapped to EL2. For nested virtualization, SMC can be trapped to
-         * the outer hypervisor. PSCI-via-SMC is a sort of ersatz EL3
-         * firmware within QEMU, and we want an EL2 guest to be able
-         * to forbid its EL1 from making PSCI calls into QEMU's
-         * "firmware" via HCR.TSC, so for these purposes treat
-         * PSCI-via-SMC as implying an EL3.
-         * This handles the very last line of the previous table.
+         * No EL3 and not using PSCI-via-SMC: stub SMC.
+         * First check for Samsung RKP calls that need emulation.
          */
-        raise_exception(env, EXCP_UDEF, syn_uncategorized(),
-                        exception_target_el(env));
+        if (!handle_uh_smc(env, cs)) {
+            env->xregs[0] = 0;
+            env->pc += 4;
+            cpu_loop_exit(cs);
+        }
+        return;
     }
 
     if (cur_el == 1 && (arm_hcr_el2_eff(env) & HCR_TSC)) {
-        /* In NS EL1, HCR controlled routing to EL2 has priority over SMD.
-         * We also want an EL2 guest to be able to forbid its EL1 from
-         * making PSCI calls into QEMU's "firmware" via HCR.TSC.
-         * This handles all the "Trap to EL2" cases of the previous table.
-         */
         raise_exception(env, EXCP_HYP_TRAP, syndrome, 2);
     }
 
-    /* Catch the two remaining "Undef insn" cases of the previous table:
-     *    - PSCI conduit is SMC but we don't have a valid PCSI call,
-     *    - We don't have EL3 or SMD is set.
-     */
     if (!arm_is_psci_call(cpu, EXCP_SMC) &&
         (smd || !arm_feature(env, ARM_FEATURE_EL3))) {
+        if (arm_feature(env, ARM_FEATURE_EL3) &&
+            !env->cp15.vbar_el[3]) {
+            if (!handle_uh_smc(env, cs)) {
+                env->xregs[0] = 0;
+                env->pc += 4;
+                cpu_loop_exit(cs);
+            }
+            return;
+        }
         raise_exception(env, EXCP_UDEF, syn_uncategorized(),
                         exception_target_el(env));
+    }
+
+    /*
+     * If we get here, SMC is about to trap to EL3 with no firmware.
+     */
+    if (arm_feature(env, ARM_FEATURE_EL3) && !env->cp15.vbar_el[3]) {
+        if (!handle_uh_smc(env, cs)) {
+            env->xregs[0] = 0;
+            env->pc += 4;
+            cpu_loop_exit(cs);
+        }
     }
 }
 
