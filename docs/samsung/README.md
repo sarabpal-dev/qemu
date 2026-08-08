@@ -30,9 +30,12 @@ matches your exact kernel build.
 
 The base `rootfs-defex.cpio.gz` environment is built using Buildroot. To compile custom binaries, tools, or tests compatible with this target, use the `buildroot_tc` toolchain.
 
-- **Toolchain Location**: `buildroot_tc` (`buildroot-tc.tar.xz`) is available under **GitHub Releases** specifically for the `samsung` branch.
-- **Cross-Compiling Example**:
+- **Toolchain Location**: `buildroot_tc` (`buildroot-tc.tar.xz`) is available under [GitHub Releases (samsung-v1)](https://github.com/sarabpal-dev/qemu/releases/tag/samsung-v1).
+- **Download & Cross-Compiling Example**:
   ```bash
+  # Download toolchain from release
+  wget https://github.com/sarabpal-dev/qemu/releases/download/samsung-v1/buildroot-tc.tar.xz
+
   # Extract toolchain and add to PATH
   tar -xf buildroot-tc.tar.xz
   export PATH="$PWD/buildroot-tc/bin:$PATH"
