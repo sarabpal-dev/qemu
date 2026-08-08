@@ -113,3 +113,11 @@ python3 kallsyms2elf.py kallsyms.txt vmlinux.kallsyms.elf
 scp -P 13337 -o StrictHostKeyChecking=no path/to/file root@localhost:/root/
 ```
 
+## Known Issues
+
+### DEFEX Violations After ~10 Minutes
+- **Symptom**: After approximately 10 minutes of kernel execution, the kernel begins throwing DEFEX violations.
+- **Workaround**: Restarting QEMU clears the error temporarily on a fresh start (the error will appear again after another 10 minutes of execution).
+- **GDB Debugging**: Time spent with the kernel paused in GDB does **not** count towards the 10-minute timer.
+- **Note**: This issue has not been deeply investigated yet, but 10 minutes provides sufficient time to run programs and perform necessary debugging.
+
