@@ -3,8 +3,9 @@ QEMU README
 ===========
 
 .. note::
+
    **Samsung Android kernel emulation**: If you are going to emulate and debug
-   a Samsung kernel, refer to `docs/samsung/README.md`_.
+   a Samsung kernel, refer to `docs/samsung/README.md <docs/samsung/README.md>`_.
    This branch includes Qualcomm SoC simulation and DEFEX/KDP support.
 
 QEMU is a generic and open source machine & userspace emulator and
