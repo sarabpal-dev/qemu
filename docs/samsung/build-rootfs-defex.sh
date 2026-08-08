@@ -131,6 +131,11 @@ for f in console null zero kmsg tty ttyAMA0 urandom random full mem ptmx; do
     rm -f "$ROOTFSDIR/dev/$f" 2>/dev/null || true
 done
 
+# Fix /var/empty permissions
+mkdir -p "$ROOTFSDIR/var/empty"
+chmod 755 "$ROOTFSDIR/var/empty"
+chmod 755 "$ROOTFSDIR/var"
+
 echo "  Base extracted (device nodes will be regenerated)"
 
 # ── Step 3: Generate device nodes (cpio binary, no root needed) ─────────
@@ -210,6 +215,79 @@ echo "[5/5] Repacking as $OUTPUT ..."
 
 REG_CPIO="$WORKDIR/regular.cpio"
 (cd "$ROOTFSDIR" && find . | cpio -o -H newc 2>/dev/null) > "$REG_CPIO"
+
+# Fix UIDs/GIDs to 0 (root:root) and /var/empty permissions in regular.cpio
+FIXED_CPIO="$WORKDIR/regular_fixed.cpio"
+python3 - "$REG_CPIO" "$FIXED_CPIO" << 'PYFIX'
+import sys, struct
+
+def pad4(n): return (n + 3) & ~3
+
+infile = sys.argv[1]
+outfile = sys.argv[2]
+
+with open(infile, 'rb') as f:
+    data = f.read()
+
+pos = 0
+out = bytearray()
+
+while pos < len(data):
+    if pos + 110 > len(data):
+        out.extend(data[pos:])
+        break
+    
+    magic = data[pos:pos+6]
+    if magic != b'070701':
+        out.extend(data[pos:])
+        break
+
+    hdr = data[pos:pos+110]
+    mode = int(hdr[14:22], 16)
+    filesize = int(hdr[54:62], 16)
+    namesize = int(hdr[94:102], 16)
+
+    header_and_name_len = pad4(110 + namesize)
+    data_len = pad4(filesize)
+    total_entry_len = header_and_name_len + data_len
+
+    if pos + total_entry_len > len(data):
+        out.extend(data[pos:])
+        break
+
+    name_raw = data[pos+110 : pos+110+namesize]
+    name = name_raw.rstrip(b'\0').decode('utf-8', errors='ignore')
+
+    # Force UID=0 and GID=0 (root:root)
+    new_uid = 0
+    new_gid = 0
+
+    # Ensure var/empty is 0755 (S_IFDIR 0o40000 | 0o755)
+    new_mode = mode
+    if name in ('./var/empty', 'var/empty', './var/empty/'):
+        new_mode = (mode & ~0o777) | 0o755
+
+    new_hdr = (
+        hdr[:14] +
+        f'{new_mode:08x}'.encode() +
+        f'{new_uid:08x}'.encode() +
+        f'{new_gid:08x}'.encode() +
+        hdr[38:]
+    )
+
+    out.extend(new_hdr)
+    out.extend(data[pos+110 : pos+total_entry_len])
+
+    pos += total_entry_len
+
+    if name == 'TRAILER!!!':
+        break
+
+with open(outfile, 'wb') as f:
+    f.write(out)
+PYFIX
+
+REG_CPIO="$FIXED_CPIO"
 
 # Strip TRAILER!!!
 REG_CPIO_TRUNC="$WORKDIR/regular_no_trailer.cpio"
