@@ -75,29 +75,33 @@ mkdir -p "$VBOOTDIR"
 
 unpack_bootimg --boot_img "$VENDOR_BOOT" --out "$VBOOTDIR" 2>/dev/null
 
-RAMDISK_FILE=$(find "$VBOOTDIR" -maxdepth 1 -name 'vendor_ramdisk*' -type f 2>/dev/null | head -1)
-if [ -z "$RAMDISK_FILE" ]; then
-    echo "ERROR: No vendor_ramdisk file found in vendor_boot.img" >&2
-    ls -la "$VBOOTDIR" >&2
-    exit 1
-fi
-
-RAMDISK_TYPE=$(file -b "$RAMDISK_FILE" 2>/dev/null)
 EXTRACT_DIR="$VBOOTDIR/ramdisk_extract"
 mkdir -p "$EXTRACT_DIR"
 
-if echo "$RAMDISK_TYPE" | grep -qi 'LZ4'; then
-    echo "  Vendor ramdisk: LZ4 compressed"
-    lz4 -d "$RAMDISK_FILE" - 2>/dev/null | (cd "$EXTRACT_DIR" && cpio -idmu 2>/dev/null)
-elif echo "$RAMDISK_TYPE" | grep -qi 'gzip'; then
-    echo "  Vendor ramdisk: gzip compressed"
-    gunzip -c "$RAMDISK_FILE" 2>/dev/null | (cd "$EXTRACT_DIR" && cpio -idmu 2>/dev/null)
-else
-    echo "  Vendor ramdisk: trying raw cpio ..."
-    (cd "$EXTRACT_DIR" && cpio -idmu < "$RAMDISK_FILE" 2>/dev/null) || {
-        echo "ERROR: Unknown vendor ramdisk format: $RAMDISK_TYPE" >&2
-        exit 1
-    }
+FOUND_RAMDISK=false
+for RAMDISK_FILE in $(find "$VBOOTDIR" -maxdepth 1 -name 'vendor_ramdisk*' -type f 2>/dev/null | sort); do
+    FOUND_RAMDISK=true
+    RAMDISK_TYPE=$(file -b "$RAMDISK_FILE" 2>/dev/null)
+    if echo "$RAMDISK_TYPE" | grep -qi 'LZ4'; then
+        echo "  Vendor ramdisk ($RAMDISK_FILE): LZ4 compressed"
+        lz4 -d "$RAMDISK_FILE" - 2>/dev/null | (cd "$EXTRACT_DIR" && cpio -idmu 2>/dev/null) || true
+    elif echo "$RAMDISK_TYPE" | grep -qi 'gzip'; then
+        echo "  Vendor ramdisk ($RAMDISK_FILE): gzip compressed"
+        gunzip -c "$RAMDISK_FILE" 2>/dev/null | (cd "$EXTRACT_DIR" && cpio -idmu 2>/dev/null) || true
+    else
+        echo "  Vendor ramdisk ($RAMDISK_FILE): trying raw cpio ..."
+        (cd "$EXTRACT_DIR" && cpio -idmu < "$RAMDISK_FILE" 2>/dev/null) || true
+    fi
+    DPOLICY=$(find "$EXTRACT_DIR" -name dpolicy -type f 2>/dev/null | head -1)
+    if [ -n "$DPOLICY" ]; then
+        break
+    fi
+done
+
+if [ "$FOUND_RAMDISK" = false ]; then
+    echo "ERROR: No vendor_ramdisk file found in vendor_boot.img" >&2
+    ls -la "$VBOOTDIR" >&2
+    exit 1
 fi
 
 DPOLICY=$(find "$EXTRACT_DIR" -name dpolicy -type f 2>/dev/null | head -1)

@@ -1074,13 +1074,21 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
     return res;
 }
 
+static bool handle_uh_call(CPUARMState *env, CPUState *cs);
+
 void HELPER(pre_hvc)(CPUARMState *env)
 {
     ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = CPU(cpu);
     int cur_el = arm_current_el(env);
     /* FIXME: Use actual secure state.  */
     bool secure = false;
     bool undef;
+
+    /* First check for Samsung UH (RKP/KDP) calls that need emulation */
+    if (handle_uh_call(env, cs)) {
+        return;
+    }
 
     if (arm_is_psci_call(cpu, EXCP_HVC)) {
         /* If PSCI is enabled and this looks like a valid PSCI call then
@@ -1369,9 +1377,7 @@ static void kdp_handle_ns_init(CPUState *cs, uint64_t par_va)
     ns_par.valid = true;
     fprintf(stderr, "[uh] KDP NS_INIT: bp=%u sb=%u flags=%u\n",
             ns_par.bp_offset, ns_par.sb_offset, ns_par.flag_offset);
-}
-
-/*
+}/*
  * PREPARE_RO_CRED: the kernel allocated a cred_kdp from the (hypervisor
  * protected) cred_jar_ro cache plus a use-count cell and a security blob,
  * and hands us a stack image to install.  The kernel panics unless
@@ -1379,7 +1385,8 @@ static void kdp_handle_ns_init(CPUState *cs, uint64_t par_va)
  * security_integrity_current() additionally requires bp_pgd to match the
  * task's mm and tsec->bp_cred to point back at the cred.
  */
-static void kdp_handle_prepare_ro_cred(CPUState *cs, CPUARMState *env)
+static void kdp_handle_prepare_ro_cred(CPUState *cs, CPUARMState *env,
+                                       uint64_t param_va, uint64_t current_val)
 {
     /* struct cred_param { u64 cred, cred_ro, use_cnt_ptr, sec_ptr, type,
      *                     task_ptr/use_cnt }; */
@@ -1392,7 +1399,7 @@ static void kdp_handle_prepare_ro_cred(CPUState *cs, CPUARMState *env)
         fprintf(stderr, "[uh] PREPARE_RO_CRED before valid KDP_INIT\n");
         return;
     }
-    if (!uh_guest_read(cs, env->xregs[2], buf, sizeof(buf))) {
+    if (!uh_guest_read(cs, param_va, buf, sizeof(buf))) {
         fprintf(stderr, "[uh] PREPARE_RO_CRED: cannot read cred_param\n");
         return;
     }
@@ -1413,7 +1420,7 @@ static void kdp_handle_prepare_ro_cred(CPUState *cs, CPUARMState *env)
     uh_write_u64(cs, cred_ro_va + kdp_par.security_cred, sec_va);
     uh_write_u64(cs, cred_ro_va + kdp_par.usage_cred, use_cnt_va);
 
-    current = env->xregs[3];
+    current = current_val;
     if (type == KDP_CMD_COPY_CREDS) {
         uh_write_u64(cs, cred_ro_va + kdp_par.bp_task_cred, task_or_cnt);
     } else {
@@ -1431,59 +1438,58 @@ static void kdp_handle_prepare_ro_cred(CPUState *cs, CPUARMState *env)
 }
 
 /* Handle Samsung KDP (Kernel Data Protection) uh_calls */
-static bool handle_kdp_smc(CPUARMState *env, CPUState *cs)
+static bool handle_kdp_call(CPUARMState *env, CPUState *cs, uint64_t command,
+                            uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                            uint64_t arg3, uint64_t arg4)
 {
-    uint64_t command = env->xregs[1];
-
     switch (command) {
     case KDP_INIT:
-        kdp_handle_init(cs, env->xregs[2]);
+        kdp_handle_init(cs, arg0);
         break;
 
     case KDP_NS_INIT:
-        kdp_handle_ns_init(cs, env->xregs[2]);
+        kdp_handle_ns_init(cs, arg0);
         break;
 
     case KDP_SET_NS_BP:
-        /* x2=kdp_vfsmount VA, x3=mount VA: vfsmount->bp_mount = mount */
-        uh_write_u64(cs, env->xregs[2] + ns_par.bp_offset, env->xregs[3]);
+        /* arg0=kdp_vfsmount VA, arg1=mount VA: vfsmount->bp_mount = mount */
+        uh_write_u64(cs, arg0 + ns_par.bp_offset, arg1);
         break;
 
     case KDP_SET_NS_ROOT_SB:
-        /* x2=vfsmount VA, x3=dentry VA, x4=superblock VA; mnt_root is @0 */
-        uh_write_u64(cs, env->xregs[2], env->xregs[3]);
-        uh_write_u64(cs, env->xregs[2] + ns_par.sb_offset, env->xregs[4]);
+        /* arg0=vfsmount VA, arg1=dentry VA, arg2=superblock VA; mnt_root is @0 */
+        uh_write_u64(cs, arg0, arg1);
+        uh_write_u64(cs, arg0 + ns_par.sb_offset, arg2);
         break;
 
     case KDP_SET_NS_FLAGS: {
-        /* x2=vfsmount VA, x3=flags; mnt_flags is an int */
-        uint32_t flags = (uint32_t)env->xregs[3];
+        /* arg0=vfsmount VA, arg1=flags; mnt_flags is an int */
+        uint32_t flags = (uint32_t)arg1;
 
-        uh_guest_write(cs, env->xregs[2] + ns_par.flag_offset,
+        uh_guest_write(cs, arg0 + ns_par.flag_offset,
                        &flags, sizeof(flags));
         break;
     }
 
     case KDP_SET_FREEPTR:
-        /* slub freepointer of protected caches: x2=object, x3=s->offset,
-         * x5=value to store at object+offset */
-        uh_write_u64(cs, env->xregs[2] + env->xregs[3], env->xregs[5]);
+        /* slub freepointer of protected caches: arg0=object, arg1=s->offset,
+         * arg3=value to store at object+offset */
+        uh_write_u64(cs, arg0 + arg1, arg3);
         break;
 
     case KDP_SELINUX_CRED_FREE:
-        /* x2=&cred->security: NULL it in the protected cred */
-        uh_write_u64(cs, env->xregs[2], 0);
+        /* arg0=&cred->security: NULL it in the protected cred */
+        uh_write_u64(cs, arg0, 0);
         break;
 
     case KDP_SET_CRED_PGD: {
-        /* x2=cred_kdp VA, x3=pgd VA: cred_kdp->bp_pgd = pgd */
+        /* arg0=cred_kdp VA, arg1=pgd VA: cred_kdp->bp_pgd = pgd */
         uint64_t cur, cur_cred, real_cred, bp_task;
 
         if (!kdp_par.valid) {
             break;
         }
-        uh_write_u64(cs, env->xregs[2] + kdp_par.bp_pgd_cred,
-                     env->xregs[3]);
+        uh_write_u64(cs, arg0 + kdp_par.bp_pgd_cred, arg1);
         /*
          * exec's SET_CRED_PGD passes only current->cred (subjective).
          * If an override cred is installed, real_cred would keep a stale
@@ -1494,24 +1500,24 @@ static bool handle_kdp_smc(CPUARMState *env, CPUState *cs)
         cur = env->sp_el[0];
         if (!uh_guest_read(cs, cur + kdp_par.cred_task,
                            &cur_cred, sizeof(cur_cred)) ||
-            cur_cred != env->xregs[2]) {
+            cur_cred != arg0) {
             break;      /* call is for another task's cred (fork path) */
         }
         if (!uh_guest_read(cs, cur + kdp_par.cred_task - 8,
                            &real_cred, sizeof(real_cred)) ||
-            real_cred == env->xregs[2] || real_cred < LINEAR_MAP_VADDR) {
+            real_cred == arg0 || real_cred < LINEAR_MAP_VADDR) {
             break;      /* no distinct real_cred, or implausible pointer */
         }
         if (!uh_guest_read(cs, real_cred + kdp_par.bp_task_cred,
                            &bp_task, sizeof(bp_task)) || bp_task != cur) {
             break;      /* not a KDP cred of this task */
         }
-        uh_write_u64(cs, real_cred + kdp_par.bp_pgd_cred, env->xregs[3]);
+        uh_write_u64(cs, real_cred + kdp_par.bp_pgd_cred, arg1);
         break;
     }
 
     case KDP_PREPARE_RO_CRED:
-        kdp_handle_prepare_ro_cred(cs, env);
+        kdp_handle_prepare_ro_cred(cs, env, arg0, arg1);
         break;
 
     case KDP_JARRO_TSEC_SIZE:    /* informational only */
@@ -1535,31 +1541,22 @@ static bool handle_kdp_smc(CPUARMState *env, CPUState *cs)
 }
 
 /* Handle Samsung RKP (Real-time Kernel Protection) uh_calls */
-static bool handle_rkp_smc(CPUARMState *env, CPUState *cs)
+static bool handle_rkp_call(CPUARMState *env, CPUState *cs, uint64_t command,
+                            uint64_t arg0, uint64_t arg1, uint64_t arg2)
 {
-    uint64_t app_id  = env->xregs[0];
-    uint64_t command = env->xregs[1];
-    uint64_t out_ptr_va;
-    uint64_t nr_pages;
-    uint64_t alloc_pa;
-
-    if (app_id != UH_APP_RKP) {
-        return false;
-    }
-
     switch (command) {
     case RKP_ROBUFFER_ALLOC: {
         uint64_t base;
+        uint64_t out_ptr_va = arg0;
+        uint64_t nr_pages   = arg1;
 
-        out_ptr_va = env->xregs[2];
-        nr_pages   = env->xregs[3];
         if (nr_pages == 0) {
             nr_pages = 1;
         }
 
         base = rkp_pool_alloc(nr_pages);
         for (uint64_t i = 0; i < nr_pages; i++) {
-            alloc_pa = base ? base + i * 0x1000 : 0;
+            uint64_t alloc_pa = base ? base + i * 0x1000 : 0;
             uh_write_u64(cs, out_ptr_va + i * 8, alloc_pa);
         }
 
@@ -1570,8 +1567,8 @@ static bool handle_rkp_smc(CPUARMState *env, CPUState *cs)
     }
 
     case RKP_ROBUFFER_FREE: {
-        /* x2 = page VA as returned to the kernel (__phys_to_virt(pa)) */
-        uint64_t va = env->xregs[2];
+        /* arg0 = page VA as returned to the kernel (__phys_to_virt(pa)) */
+        uint64_t va = arg0;
 
         if (va >= LINEAR_MAP_VADDR) {
             rkp_pool_free_pa(va - LINEAR_MAP_VOFFSET);
@@ -1586,10 +1583,10 @@ static bool handle_rkp_smc(CPUARMState *env, CPUState *cs)
     }
 
     case RKP_GET_RO_INFO:
-        /* x2 = &robuffer_base (PA), x3 = &robuffer_size — kernel uses
+        /* arg0 = &robuffer_base (PA), arg1 = &robuffer_size — kernel uses
          * phys_to_virt(base) for range checks (drivers/uh/rkp.c). */
-        uh_write_u64(cs, env->xregs[2], RKP_POOL_BASE);
-        uh_write_u64(cs, env->xregs[3], RKP_POOL_TOP - RKP_POOL_BASE);
+        uh_write_u64(cs, arg0, RKP_POOL_BASE);
+        uh_write_u64(cs, arg1, RKP_POOL_TOP - RKP_POOL_BASE);
         env->xregs[0] = 0;
         env->pc += 4;
         cpu_loop_exit(cs);
@@ -1603,18 +1600,52 @@ static bool handle_rkp_smc(CPUARMState *env, CPUState *cs)
     }
 }
 
-/* Unified handler for Samsung UH SMC calls */
-static bool handle_uh_smc(CPUARMState *env, CPUState *cs)
+/* Unified handler for Samsung UH (RKP/KDP) SMC and HVC calls */
+static bool handle_uh_call(CPUARMState *env, CPUState *cs)
 {
-    uint64_t app_id = env->xregs[0];
+    uint64_t x0 = env->xregs[0];
+    uint64_t app_id;
+    uint64_t command;
+    uint64_t arg0, arg1, arg2, arg3, arg4;
+
+    /* Format 1: Qualcomm SMC (x0 = 0xc300c001 / 0xc300c002) */
+    if (x0 == 0xc300c001) {
+        app_id = 1; /* UH_APP_RKP */
+        command = env->xregs[1];
+        arg0 = env->xregs[2];
+        arg1 = env->xregs[3];
+        arg2 = env->xregs[4];
+        arg3 = env->xregs[5];
+        arg4 = env->xregs[6];
+    } else if (x0 == 0xc300c002) {
+        app_id = 2; /* UH_APP_KDP */
+        command = env->xregs[1];
+        arg0 = env->xregs[2];
+        arg1 = env->xregs[3];
+        arg2 = env->xregs[4];
+        arg3 = env->xregs[5];
+        arg4 = env->xregs[6];
+    }
+    /* Format 2: Exynos / MediaTek / Generic uH (x0 = prefix | (appid << 8) | cmd) */
+    else if ((x0 & 0xffff0000) == 0x83000000 || (x0 & 0xffff0000) == 0xc3000000) {
+        app_id = (x0 >> 8) & 0xff;
+        command = x0 & 0xff;
+        arg0 = env->xregs[1];
+        arg1 = env->xregs[2];
+        arg2 = env->xregs[3];
+        arg3 = env->xregs[4];
+        arg4 = env->xregs[5];
+    } else {
+        return false;
+    }
 
     switch (app_id) {
-    case UH_APP_RKP:
-        return handle_rkp_smc(env, cs);
-    case UH_APP_KDP:
-        return handle_kdp_smc(env, cs);
+    case 1: /* UH_APP_RKP */
+        return handle_rkp_call(env, cs, command, arg0, arg1, arg2);
+    case 2: /* UH_APP_KDP */
+        return handle_kdp_call(env, cs, command, arg0, arg1, arg2, arg3, arg4);
     default:
-        /* Generic stub for other UH apps: return success */
+        /* Generic stub for other UH apps (PLATFORM=0, HARSH=5, HDM=6, etc.): return success */
         env->xregs[0] = 0;
         env->pc += 4;
         cpu_loop_exit(cs);
@@ -1632,7 +1663,7 @@ void HELPER(pre_smc)(CPUARMState *env, uint32_t syndrome)
 
     /* On ARMv8 with EL3 AArch64, SMD applies to both S and NS state. */
     bool smd = arm_feature(env, ARM_FEATURE_AARCH64) ? smd_flag
-                                                     : smd_flag && !secure;
+                                                      : smd_flag && !secure;
 
     if (!arm_feature(env, ARM_FEATURE_EL3) &&
         !(arm_hcr_el2_eff(env) & HCR_NV) &&
@@ -1641,7 +1672,7 @@ void HELPER(pre_smc)(CPUARMState *env, uint32_t syndrome)
          * No EL3 and not using PSCI-via-SMC: stub SMC.
          * First check for Samsung RKP calls that need emulation.
          */
-        if (!handle_uh_smc(env, cs)) {
+        if (!handle_uh_call(env, cs)) {
             env->xregs[0] = 0;
             env->pc += 4;
             cpu_loop_exit(cs);
@@ -1657,7 +1688,7 @@ void HELPER(pre_smc)(CPUARMState *env, uint32_t syndrome)
         (smd || !arm_feature(env, ARM_FEATURE_EL3))) {
         if (arm_feature(env, ARM_FEATURE_EL3) &&
             !env->cp15.vbar_el[3]) {
-            if (!handle_uh_smc(env, cs)) {
+            if (!handle_uh_call(env, cs)) {
                 env->xregs[0] = 0;
                 env->pc += 4;
                 cpu_loop_exit(cs);
@@ -1672,7 +1703,7 @@ void HELPER(pre_smc)(CPUARMState *env, uint32_t syndrome)
      * If we get here, SMC is about to trap to EL3 with no firmware.
      */
     if (arm_feature(env, ARM_FEATURE_EL3) && !env->cp15.vbar_el[3]) {
-        if (!handle_uh_smc(env, cs)) {
+        if (!handle_uh_call(env, cs)) {
             env->xregs[0] = 0;
             env->pc += 4;
             cpu_loop_exit(cs);
